@@ -168,7 +168,7 @@ impl<'a> I2c<'a> {
     /// If I2C bus is idling or busy
     pub fn is_idle(&self) -> Option<bool> {
         match reports::i2c::get_status(self.device) {
-            Ok(s) => Some(s == I2cBusStatus::ControllerIdle),
+            Ok(s) => Some(s.contains(I2cBusStatus::ControllerIdle)),
             Err(e) => None,
         }
     }
