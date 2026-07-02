@@ -191,7 +191,7 @@ pub(crate) fn write(
 
     let mut start = flag.contains(I2cCondition::Start);
     let mut restart = flag.contains(I2cCondition::ReStart);
-    let mut stop = flag.contains(I2cCondition::Stop);
+    let stop = flag.contains(I2cCondition::Stop);
 
     loop {
         let mut fval = I2cCondition::None;
@@ -226,7 +226,22 @@ pub(crate) fn write(
         if let Ok(_) = res {
             byte_written += size_write;
             if byte_remained <= 0 {
-                return Ok(byte_written);
+                // wait for transaction complete
+                let status = loop {
+                    let status = get_status(device)?;
+                    if !stop || !status.contains(I2cBusStatus::BusBusy) {
+                        break status;
+                    }
+                };
+                if status.contains(I2cBusStatus::AddressNack)
+                    || status.contains(I2cBusStatus::DataNack)
+                {
+                    return Err(Ft260Error::I2cError {
+                        message: "Device returned NACK".to_string(),
+                    });
+                } else {
+                    return Ok(byte_written);
+                }
             } else {
                 continue;
             }
