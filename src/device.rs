@@ -61,11 +61,23 @@ pub fn open_by_vid_pid(vendor_id: u16, product_id: u16, interface: i32) -> Optio
     Device::try_new(vendor_id, product_id, interface, 0) // try find only the first one
 }
 
+/// Open FT260 by its HID device path (as enumerated by `hidapi`).
+///
+/// Several FT260 chips can be attached at once; the path picks one of them,
+/// whereas [`open`] always takes the first matching device.
+pub fn open_by_path(path: &str) -> Option<Device> {
+    let api = hidapi::HidApi::new().ok()?;
+    let info = api
+        .device_list()
+        .find(|info| info.path().to_string_lossy() == path)?;
+    let hid = info.open_device(&api).ok()?;
+    Some(Device::new(hid))
+}
+
 impl Device {
     /// Create new `Device` instance from `hidapi::HidDevice` instance.  
     /// When it is opened, a new thread is spawned and it continues to read HID input report from the device.
     fn new(hid: hidapi::HidDevice) -> Self {
-        dbg!(&hid);
         let mutex_hid = Arc::new(Mutex::new(hid));
         let mutex_fifo = Arc::new(Mutex::new(ReportFifo::new()));
         let reading = Arc::new(AtomicBool::new(true));
@@ -74,7 +86,6 @@ impl Device {
             let mutex_hid = mutex_hid.clone();
             let mutex_fifo = mutex_fifo.clone();
             let reading = reading.clone();
-            print!("now starting a thread to read HID");
             move || loop {
                 let mut buf = [0u8; 256];
                 let mut has_report = false;
@@ -91,7 +102,6 @@ impl Device {
                 }
                 thread::yield_now();
                 if !reading.load(Ordering::Relaxed) {
-                    print!("`reading` got to be `false`");
                     return;
                 }
             }
@@ -118,8 +128,6 @@ impl Device {
             if (vendor_id, product_id, interface)
                 == (inf.vendor_id(), inf.product_id(), inf.interface_number())
             {
-                print!("found:");
-                dbg!(inf);
                 infs.push(inf);
             }
         }
@@ -128,8 +136,6 @@ impl Device {
             None
         } else {
             if let Ok(hid) = infs[index].open_device(&api) {
-                print!("opened:");
-                dbg!(index);
                 Some(Self::new(hid))
             } else {
                 None
@@ -192,8 +198,6 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        print!("drop it:");
-        dbg!(&self);
         // stop reading thread
         self.reading.store(false, Ordering::Relaxed);
         loop {
