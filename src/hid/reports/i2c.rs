@@ -8,7 +8,17 @@ use crate::hid::reports::*;
 use crate::{Ft260Error, Ft260Result};
 
 pub(crate) fn init(device: &Device, kbps: u16) -> Ft260Result<()> {
-    ft260_set_request_u16(device, Request::SetI2cClockSpeed, kbps)
+    // `SetI2cClockSpeed` takes the value MSB first (FTDI tooling sends 0x00,0x64
+    // for 100 kHz); the little-endian helper would ask for 25.6 MHz.
+    ft260_set_feature(
+        device,
+        &[
+            ReportId::FeatSystemSetting as u8,
+            Request::SetI2cClockSpeed as u8,
+            ((kbps >> 8) & 0xFF) as u8,
+            (kbps & 0xFF) as u8,
+        ],
+    )
 }
 
 fn decide_i2c_report_id(length: usize) -> ReportId {
@@ -127,6 +137,41 @@ pub(crate) fn read(
     byte_to_read: usize,
     duration_wait: Duration,
 ) -> Ft260Result<usize> {
+    if device.is_sequential() {
+        // No reader thread (see `open_by_path_sequential`): the response is
+        // read on this thread, after the request, so nothing can be pending
+        // while the request goes out. Drain whatever an earlier transaction
+        // left in the input queue first (status reports included).
+        let mut drain = [0u8; 256];
+        for _ in 0..16 {
+            match device.read_input(&mut drain, 0) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        let res = i2c_read_request(device, device_address, flag, byte_to_read);
+        if res.is_err() {
+            return Err(res.err().unwrap());
+        }
+        let timeout_ms = duration_wait.as_millis().min(i32::MAX as u128) as i32;
+        let mut buf_read = [0u8; 256];
+        // hidapi hands back the raw HID report: [report id, payload length, data…]
+        let want = (byte_to_read + 2).min(buf_read.len());
+        let read = device.read_input(&mut buf_read[..want], timeout_ms)?;
+        if read < 2 {
+            return Ok(0);
+        }
+        let payload_len = (buf_read[1] as usize).min(read - 2);
+        let size = payload_len.min(buf.len());
+        buf[..size].copy_from_slice(&buf_read[2..2 + size]);
+        return Ok(size);
+    }
+
+    // Drop whatever is left from earlier transactions: the reader thread keeps
+    // pushing input reports, and a stale one would be handed back as this
+    // read's data (a "device" at every address, or one that disappears).
+    clear_input_report_queue_i2c(device);
     let res = i2c_read_request(device, device_address, flag, byte_to_read);
     if res.is_err() {
         return Err(res.err().unwrap());
@@ -188,6 +233,8 @@ pub(crate) fn write(
 ) -> Ft260Result<usize> {
     let mut byte_written = 0usize;
     let mut byte_remained = byte_to_write;
+
+    clear_input_report_queue_i2c(device);
 
     let mut start = flag.contains(I2cCondition::Start);
     let mut restart = flag.contains(I2cCondition::ReStart);

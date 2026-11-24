@@ -8,7 +8,7 @@ use std::thread;
 use std::thread::JoinHandle;
 
 // use hidapi crate only in this module
-use hidapi::{DeviceInfo, HidError};
+use hidapi::{DeviceInfo as HidDeviceInfo, HidError};
 
 use crate::hid::rep_fifo::ReportFifo;
 use crate::io::{gpio::Gpio, i2c::I2c, uart::Uart};
@@ -40,7 +40,10 @@ pub struct Device {
     hid: Arc<Mutex<hidapi::HidDevice>>,
     fifo: Arc<Mutex<ReportFifo>>,
     reading: Arc<AtomicBool>,
-    handle: JoinHandle<()>,
+    /// `None` in sequential mode (no reader thread).
+    handle: Option<JoinHandle<()>>,
+    /// Reads are driven by the caller, not by a background thread.
+    sequential: bool,
 }
 
 /// Default USB Vendor ID for FT260 device
@@ -61,6 +64,31 @@ pub fn open_by_vid_pid(vendor_id: u16, product_id: u16, interface: i32) -> Optio
     Device::try_new(vendor_id, product_id, interface, 0) // try find only the first one
 }
 
+/// One FT260 HID interface found on the host.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    /// HID path, the argument of [`open_by_path`].
+    pub path: String,
+    /// HID interface number (0 = I2C/GPIO, 1 = UART).
+    pub interface: i32,
+    pub serial_number: Option<String>,
+}
+
+/// Every FT260 HID interface on the host (both interfaces of every chip).
+pub fn enumerate() -> Vec<DeviceInfo> {
+    let Ok(api) = hidapi::HidApi::new() else {
+        return Vec::new();
+    };
+    api.device_list()
+        .filter(|info| info.vendor_id() == VID_DEFAULT && info.product_id() == PID_DEFAULT)
+        .map(|info| DeviceInfo {
+            path: info.path().to_string_lossy().into_owned(),
+            interface: info.interface_number(),
+            serial_number: info.serial_number().map(str::to_string),
+        })
+        .collect()
+}
+
 /// Open FT260 by its HID device path (as enumerated by `hidapi`).
 ///
 /// Several FT260 chips can be attached at once; the path picks one of them,
@@ -72,6 +100,27 @@ pub fn open_by_path(path: &str) -> Option<Device> {
         .find(|info| info.path().to_string_lossy() == path)?;
     let hid = info.open_device(&api).ok()?;
     Some(Device::new(hid))
+}
+
+/// Open FT260 by HID path **without** the background reader thread.
+///
+/// On Windows a pending overlapped read on a vendor-defined HID interface can
+/// hold back `hid_write` (it dies with `ERROR_IO_PENDING` after the write
+/// timeout), so a write-then-read protocol deadlocks with a reader thread
+/// running. In this mode every read is done synchronously by the caller.
+pub fn open_by_path_sequential(path: &str) -> Option<Device> {
+    let api = hidapi::HidApi::new().ok()?;
+    let info = api
+        .device_list()
+        .find(|info| info.path().to_string_lossy() == path)?;
+    let hid = info.open_device(&api).ok()?;
+    Some(Device {
+        hid: Arc::new(Mutex::new(hid)),
+        fifo: Arc::new(Mutex::new(ReportFifo::new())),
+        reading: Arc::new(AtomicBool::new(false)),
+        handle: None,
+        sequential: true,
+    })
 }
 
 impl Device {
@@ -111,7 +160,8 @@ impl Device {
             hid: mutex_hid,
             fifo: mutex_fifo,
             reading,
-            handle,
+            handle: Some(handle),
+            sequential: false,
         }
     }
 
@@ -123,7 +173,7 @@ impl Device {
         }
 
         let api = hidapi::HidApi::new().expect("Failed to create HID API context");
-        let mut infs: Vec<&DeviceInfo> = Vec::new();
+        let mut infs: Vec<&HidDeviceInfo> = Vec::new();
         for inf in api.device_list() {
             if (vendor_id, product_id, interface)
                 == (inf.vendor_id(), inf.product_id(), inf.interface_number())
@@ -141,6 +191,11 @@ impl Device {
                 None
             }
         }
+    }
+
+    /// True when reads are done synchronously by the caller (no reader thread).
+    pub(crate) fn is_sequential(&self) -> bool {
+        self.sequential
     }
 
     /// Exclusive reference to FIFO instance for HID input report from FT260 device
@@ -198,11 +253,12 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        // stop reading thread
         self.reading.store(false, Ordering::Relaxed);
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
         loop {
-            if self.handle.is_finished() {
-                println!("joined.");
+            if handle.is_finished() {
                 return;
             }
         }

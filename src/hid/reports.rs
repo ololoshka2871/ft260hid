@@ -10,14 +10,14 @@ pub(crate) type Report = Option<Vec<u8>>;
 
 pub(crate) type FeatureReportBuffer = [u8; 64];
 
-fn clear_input_report_queue_i2c(device: &Device) {
-    let id = ReportId::InOutI2cReport04 as u8;
-    device.fifo().clear(id);
-}
-
 fn pop_input_report_i2c(device: &Device) -> Report {
     let id = ReportId::InOutI2cReport04 as u8;
     device.fifo().pop_report(id)
+}
+
+fn clear_input_report_queue_i2c(device: &Device) {
+    let id = ReportId::InOutI2cReport04 as u8;
+    device.fifo().clear(id);
 }
 
 fn get_input_reports_count_i2c(device: &Device) -> usize {
